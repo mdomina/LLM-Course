@@ -264,53 +264,98 @@ trainer.train()
 
 ### Tecniche avanzate
 
-**Mixed Precision (fp16)** — dimezza la memoria usata, accelera il training sulle GPU moderne:
+> 💡 **Glossario rapido — leggi prima di continuare**
+>
+> - **Learning rate** (tasso di apprendimento): quanto "in fretta" il modello modifica i suoi parametri ad ogni passo di training. Pensa di dover trovare il punto più basso di una valle camminando bendato: se fai passi troppo grandi rischi di saltare oltre la valle (il modello non converge), se li fai troppo piccoli ci vuole un'eternità (training lentissimo). Il valore tipico è `2e-5` cioè `0.00002` — molto piccolo di proposito, per aggiustare i pesi con delicatezza.
+>
+> - **Epoch**: una passata completa su tutto il dataset di training. Se hai 3.000 frasi e alleni per 3 epoch, il modello "vede" ogni frase 3 volte in totale.
+>
+> - **Batch / Batch size**: invece di aggiornare il modello dopo ogni singola frase, si raggruppano N frasi insieme (un "batch") e si aggiorna una volta sola. Con `batch_size=16` il modello vede 16 frasi, calcola l'errore medio, e aggiorna i pesi. Batch più grandi danno aggiornamenti più stabili ma richiedono più memoria.
+>
+> - **GPU e VRAM**: la GPU (scheda grafica) è molto più veloce della CPU per i calcoli dei modelli — il training passa da ore a minuti. La VRAM è la memoria della GPU: i modelli grandi possono non entrarci, ed è il problema che le tecniche sotto risolvono.
+>
+> - **Loss** (perdita): un numero che misura quanto il modello sta sbagliando. Più è bassa, meglio il modello sta imparando. L'obiettivo del training è minimizzarla.
 
-```python
-training_args = TrainingArguments("test-trainer", eval_strategy="epoch", fp16=True)
-```
+---
 
-**Gradient Accumulation** — simula un batch size più grande quando la GPU ha poca memoria:
+**1. Mixed Precision (`fp16`) — usa meno memoria senza perdere qualità**
+
+Normalmente ogni peso del modello è salvato come numero a 32 bit. Usando 16 bit (metà dello spazio) si occupa **la metà della VRAM** e il training accelera, senza differenze apprezzabili nei risultati. È la prima ottimizzazione da provare se hai una GPU moderna.
 
 ```python
 training_args = TrainingArguments(
     "test-trainer",
-    per_device_train_batch_size=4,
-    gradient_accumulation_steps=4,  # Batch effettivo = 4 * 4 = 16
+    eval_strategy="epoch",
+    fp16=True,  # Attiva la precisione a 16 bit — quasi gratuito in termini di qualità
 )
 ```
 
-**Learning Rate Scheduler** — controlla come decresce il learning rate:
+> ⚠️ Funziona solo su GPU NVIDIA. Su CPU o Mac con chip Apple, ignoralo.
+
+---
+
+**2. Gradient Accumulation — simula un batch grande anche con poca VRAM**
+
+**Problema concreto**: vorresti processare 16 frasi alla volta per avere aggiornamenti stabili, ma la tua GPU ne regge solo 4.
+
+**Soluzione**: processa 4 frasi per 4 volte di fila *senza* aggiornare i pesi, accumula gli errori calcolati (i "gradienti"), poi aggiorna i pesi una volta sola alla fine. Il risultato matematico è identico a usare un batch di 16, ma senza richiedere più memoria.
 
 ```python
 training_args = TrainingArguments(
     "test-trainer",
-    learning_rate=2e-5,
-    lr_scheduler_type="cosine",  # Alternativa al decay lineare (default)
+    per_device_train_batch_size=4,   # Quante frasi processa la GPU per volta
+    gradient_accumulation_steps=4,   # Quante volte accumula prima di aggiornare i pesi
+    # Effetto finale = batch size di 4 × 4 = 16 frasi per aggiornamento
 )
 ```
 
-**Early Stopping** — ferma il training se la performance non migliora:
+---
+
+**3. Learning Rate Scheduler — il learning rate cambia nel tempo**
+
+Usare sempre lo stesso learning rate non è ottimale: conviene iniziare con passi un po' più grandi (imparare in fretta) e finire con passi più piccoli (rifinire con precisione). Lo "scheduler" gestisce questa variazione in automatico.
+
+Due modalità comuni:
+- **Lineare** (default): il learning rate scende in modo uniforme da `2e-5` fino a `0` alla fine del training.
+- **Coseno**: scende seguendo una curva più dolce, con una discesa graduale all'inizio e alla fine.
+
+```python
+training_args = TrainingArguments(
+    "test-trainer",
+    learning_rate=2e-5,           # Valore di partenza (consigliato per BERT)
+    lr_scheduler_type="cosine",   # Prova "cosine" in alternativa al default "linear"
+)
+```
+
+> 💡 Se non sai quale scegliere, lascia il default lineare. La differenza di risultato è spesso minima.
+
+---
+
+**4. Early Stopping — fermati automaticamente quando smetti di migliorare**
+
+Se alleni il modello troppo a lungo, inizia a **memorizzare** il training set invece di imparare a generalizzare (overfitting). L'early stopping monitora la performance sul validation set e ferma il training da solo non appena non migliora per N valutazioni consecutive.
+
+**Analogia**: immagina di studiare per un esame. All'inizio migliori velocemente. Poi arriva un punto in cui studiare ancora non aiuta — anzi ti confonde. L'early stopping riconosce quel momento e dice "basta così".
 
 ```python
 from transformers import EarlyStoppingCallback
 
 training_args = TrainingArguments(
     output_dir="./results",
-    eval_strategy="steps",
-    eval_steps=100,
-    save_strategy="steps",
+    eval_strategy="steps",        # Valuta ogni N step, non solo a fine epoch
+    eval_steps=100,               # Valuta ogni 100 step
+    save_strategy="steps",        # Salva un checkpoint ogni 100 step
     save_steps=100,
-    load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    greater_is_better=False,
-    num_train_epochs=10,
+    load_best_model_at_end=True,  # Alla fine usa il checkpoint migliore, non l'ultimo
+    metric_for_best_model="eval_loss",  # "migliore" = validation loss più bassa
+    greater_is_better=False,      # Per la loss: più bassa è meglio → False
+    num_train_epochs=10,          # Metti un numero alto: sarà l'early stopping a fermare prima
 )
 
 trainer = Trainer(
     ...
     callbacks=[EarlyStoppingCallback(early_stopping_patience=3)],
-    # Ferma se la validation loss non migliora per 3 valutazioni consecutive
+    # patience=3 → se dopo 3 valutazioni consecutive la loss non migliora, fermati
 )
 ```
 
